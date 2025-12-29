@@ -1,9 +1,9 @@
 mod license;
 
-use crate::{process::ProcessBuilderExt as _, shell::Shell, toolchain, User};
-use anyhow::{bail, Context as _};
+use crate::{User, process::ProcessBuilderExt as _, shell::Shell, toolchain};
+use anyhow::{Context as _, bail};
 use camino::{Utf8Path, Utf8PathBuf};
-use cargo_metadata as cm;
+use cargo_metadata::{self as cm, Edition, Target, TargetKind};
 use cargo_util::ProcessBuilder;
 use if_chain::if_chain;
 use indoc::indoc;
@@ -18,7 +18,6 @@ use std::{
     path::{Path, PathBuf},
     str,
 };
-use strum::EnumString;
 
 pub(crate) fn locate_project(cwd: &Path) -> anyhow::Result<PathBuf> {
     cwd.ancestors()
@@ -47,7 +46,7 @@ pub(crate) fn resolve_behavior(
     let CargoToml { workspace } = toml::from_str(cargo_toml)?;
     return Ok(workspace
         .resolver
-        .unwrap_or_else(|| package.edition().default_resolver_behavior()));
+        .unwrap_or_else(|| ResolveBehavior::default_from(package.edition)));
 
     #[derive(Deserialize)]
     struct CargoToml {
@@ -136,8 +135,8 @@ pub(crate) fn cargo_check_using_current_lockfile_and_cache(
         .rand_bytes(0)
         .tempdir()?;
 
-    let orig_manifest =
-        cargo_util::paths::read(package.manifest_path.as_ref())?.parse::<toml_edit::Document>()?;
+    let orig_manifest = cargo_util::paths::read(package.manifest_path.as_ref())?
+        .parse::<toml_edit::DocumentMut>()?;
 
     let mut temp_manifest = indoc! {r#"
         [package]
@@ -145,11 +144,11 @@ pub(crate) fn cargo_check_using_current_lockfile_and_cache(
         version = "0.0.0"
         edition = ""
     "#}
-    .parse::<toml_edit::Document>()
+    .parse::<toml_edit::DocumentMut>()
     .unwrap();
 
     temp_manifest["package"]["name"] = toml_edit::value(package_name);
-    temp_manifest["package"]["edition"] = toml_edit::value(&*package.edition);
+    temp_manifest["package"]["edition"] = toml_edit::value(package.edition.to_string());
     let mut tbl = toml_edit::Table::new();
     tbl["name"] = toml_edit::value(crate_name);
     tbl["path"] = toml_edit::value(format!("{}.rs", crate_name));
@@ -353,14 +352,14 @@ impl MetadataExt for cm::Metadata {
         &'a self,
         name: &str,
     ) -> anyhow::Result<(&'a cm::Target, &'a cm::Package)> {
-        target_by_kind_and_name(self, "bin", name)
+        target_by_kind_and_name(self, TargetKind::Bin, name)
     }
 
     fn example_target_by_name<'a>(
         &'a self,
         name: &str,
     ) -> anyhow::Result<(&'a cm::Target, &'a cm::Package)> {
-        target_by_kind_and_name(self, "example", name)
+        target_by_kind_and_name(self, TargetKind::Example, name)
     }
 
     fn target_by_src_path<'a>(
@@ -469,17 +468,17 @@ impl MetadataExt for cm::Metadata {
             .filter(|node_dep| satisfies(node_dep, need_dev_deps))
             .flat_map(|node_dep| {
                 let lib_package = &self[&node_dep.pkg];
-                let lib_target =
-                    lib_package.targets.iter().find(|cm::Target { kind, .. }| {
-                        *kind == ["lib".to_owned()] || *kind == ["proc-macro".to_owned()]
-                    })?;
+                let lib_target = lib_package.targets.iter().find(|target| {
+                    target.kind.contains(&TargetKind::Lib)
+                        || target.kind.contains(&TargetKind::ProcMacro)
+                })?;
                 let (lib_extern_crate_name, lib_name_in_toml) = if renames.contains(&node_dep.name)
                 {
-                    (node_dep.name.clone(), &node_dep.name)
+                    (node_dep.name.clone(), node_dep.name.clone())
                 } else {
-                    (lib_target.crate_name(), &lib_package.name)
+                    (lib_target.crate_name(), lib_package.name.to_string())
                 };
-                if cargo_udeps_outcome.contains(lib_name_in_toml) {
+                if cargo_udeps_outcome.contains(&lib_name_in_toml) {
                     return None;
                 }
                 Some((&lib_package.id, (lib_target, lib_extern_crate_name)))
@@ -500,7 +499,7 @@ impl MetadataExt for cm::Metadata {
         while {
             let next = deps
                 .iter()
-                .filter(|(_, (cm::Target { kind, .. }, _))| *kind == ["lib".to_owned()])
+                .filter(|(_, (cm::Target { kind, .. }, _))| kind == &vec![TargetKind::Lib])
                 .map(|(package_id, _)| nodes[package_id])
                 .flat_map(|cm::Node { deps, .. }| deps)
                 .filter(|node_dep| {
@@ -508,9 +507,10 @@ impl MetadataExt for cm::Metadata {
                 })
                 .flat_map(|cm::NodeDep { pkg, .. }| {
                     let package = &self[pkg];
-                    let target = package.targets.iter().find(|cm::Target { kind, .. }| {
-                        *kind == ["lib".to_owned()] || *kind == ["proc-macro".to_owned()]
-                    })?;
+                    let target = package
+                        .targets
+                        .iter()
+                        .find(|target| target.is_lib() || target.is_proc_macro())?;
                     let mut extern_crate_name = format!(
                         "__{}_{}",
                         package.name.replace('-', "_"),
@@ -571,7 +571,7 @@ impl MetadataExt for cm::Metadata {
                 .flat_map(|p| p.targets.iter().map(move |t| (t, p)))
                 .find(|(t, _)| {
                     t.crate_name() == extern_crate_name
-                        && (*t.kind == ["lib".to_owned()] || *t.kind == ["proc-macro".to_owned()])
+                        && (t.is_lib() || t.is_proc_macro())
                 })
                 .map(|(_, p)| p)
                 .or_else(|| {
@@ -620,9 +620,7 @@ impl MetadataExt for cm::Metadata {
                     self[pkg]
                         .targets
                         .iter()
-                        .find(|cm::Target { kind, .. }| {
-                            *kind == ["lib".to_owned()] || *kind == ["proc-macro".to_owned()]
-                        })?
+                        .find(|target| target.is_lib() || target.is_proc_macro())?
                         .crate_name()
                 };
                 Some((pkg, extern_crate_name))
@@ -633,11 +631,11 @@ impl MetadataExt for cm::Metadata {
 
 fn target_by_kind_and_name<'a>(
     metadata: &'a cm::Metadata,
-    kind: &str,
+    kind: TargetKind,
     name: &str,
 ) -> anyhow::Result<(&'a cm::Target, &'a cm::Package)> {
     match *targets_in_ws(metadata)
-        .filter(|(t, _)| t.name == name && t.kind == [kind.to_owned()])
+        .filter(|(t, _)| t.name == name && t.is_kind(kind.clone()))
         .collect::<Vec<_>>()
     {
         [] => bail!("no {} target named `{}`", kind, name),
@@ -670,21 +668,21 @@ pub(crate) trait PackageExt {
 
 impl PackageExt for cm::Package {
     fn has_custom_build(&self) -> bool {
-        self.targets.iter().any(TargetExt::is_custom_build)
+        self.targets.iter().any(Target::is_custom_build)
     }
 
     fn has_lib(&self) -> bool {
-        self.targets.iter().any(TargetExt::is_lib)
+        self.targets.iter().any(Target::is_lib)
     }
 
     fn has_proc_macro(&self) -> bool {
-        self.targets.iter().any(TargetExt::is_proc_macro)
+        self.targets.iter().any(Target::is_proc_macro)
     }
 
     fn lib_like_target(&self) -> Option<&cm::Target> {
-        self.targets.iter().find(|cm::Target { kind, .. }| {
-            [&["lib".to_owned()][..], &["proc-macro".to_owned()][..]].contains(&&**kind)
-        })
+        self.targets
+            .iter()
+            .find(|target| target.is_lib() || target.is_proc_macro())
     }
 
     fn manifest_dir(&self) -> &Utf8Path {
@@ -692,7 +690,7 @@ impl PackageExt for cm::Package {
     }
 
     fn edition(&self) -> Edition {
-        self.edition.parse().expect("`edition` modified invalidly")
+        self.edition
     }
 
     fn read_license_text(&self, mine: &[User], cache_dir: &Path) -> anyhow::Result<Option<String>> {
@@ -723,36 +721,11 @@ impl PackageIdExt for cm::PackageId {
 }
 
 pub(crate) trait TargetExt {
-    fn is_bin(&self) -> bool;
-    fn is_example(&self) -> bool;
-    fn is_custom_build(&self) -> bool;
-    fn is_lib(&self) -> bool;
-    fn is_proc_macro(&self) -> bool;
     fn crate_name(&self) -> String;
     fn target_option(&self) -> Vec<&str>;
 }
 
 impl TargetExt for cm::Target {
-    fn is_bin(&self) -> bool {
-        self.kind == ["bin".to_owned()]
-    }
-
-    fn is_example(&self) -> bool {
-        self.kind == ["example".to_owned()]
-    }
-
-    fn is_custom_build(&self) -> bool {
-        self.kind == ["custom-build".to_owned()]
-    }
-
-    fn is_lib(&self) -> bool {
-        self.kind == ["lib".to_owned()]
-    }
-
-    fn is_proc_macro(&self) -> bool {
-        self.kind == ["proc-macro".to_owned()]
-    }
-
     fn crate_name(&self) -> String {
         self.name.replace('-', "_")
     }
@@ -782,29 +755,24 @@ impl SourceExt for cm::Source {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, EnumString)]
-pub(crate) enum Edition {
-    #[strum(serialize = "2015")]
-    Edition2015,
-    #[strum(serialize = "2018")]
-    Edition2018,
-    #[strum(serialize = "2021")]
-    Edition2021,
-}
-
-impl Edition {
-    fn default_resolver_behavior(self) -> ResolveBehavior {
-        match self {
-            Self::Edition2015 | Self::Edition2018 => ResolveBehavior::V1,
-            Self::Edition2021 => ResolveBehavior::V2,
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, PartialOrd, Deserialize)]
 pub(crate) enum ResolveBehavior {
     #[serde(rename = "1")]
     V1,
     #[serde(rename = "2")]
     V2,
+    #[serde(rename = "3")]
+    V3,
+}
+
+impl ResolveBehavior {
+    fn default_from(edition: Edition) -> ResolveBehavior {
+        use Edition::*;
+
+        match edition {
+            E2015 | E2018 => ResolveBehavior::V1,
+            E2021 => ResolveBehavior::V2,
+            _ => ResolveBehavior::V3,
+        }
+    }
 }

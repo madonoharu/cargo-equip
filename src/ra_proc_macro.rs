@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Context as _};
+use anyhow::{Context as _, anyhow};
 use cargo_metadata as cm;
 use itertools::chain;
 use maplit::btreemap;
 use ra_ap_paths::AbsPath;
 use ra_ap_proc_macro_api::{
-    msg::PanicMessage, MacroDylib, ProcMacro, ProcMacroKind, ProcMacroServer,
+    MacroDylib, ProcMacro, ProcMacroKind, ProcMacroServer, msg::PanicMessage,
 };
 use ra_ap_tt::{self as tt, DelimiterKind, Leaf, TokenId};
 use semver::Version;
@@ -22,7 +22,7 @@ pub(crate) fn list_proc_macro_dylibs<P: FnMut(&cm::PackageId) -> bool>(
             cm::Message::CompilerArtifact(artifact) => Some(artifact),
             _ => None,
         })
-        .filter(|cm::Artifact { target, .. }| *target.kind == ["proc-macro".to_owned()])
+        .filter(|cm::Artifact { target, .. }| target.is_proc_macro())
         .filter(|cm::Artifact { package_id, .. }| filter(package_id))
         .flat_map(
             |cm::Artifact {

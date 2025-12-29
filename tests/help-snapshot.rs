@@ -9,7 +9,7 @@ fn helps() -> anyhow::Result<()> {
 }
 
 fn run(flag: &str) -> anyhow::Result<String> {
-    let assert = assert_cmd::Command::cargo_bin("cargo-equip")?
+    let assert = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cargo-equip"))
         .args(["equip", flag])
         .assert()
         .success();

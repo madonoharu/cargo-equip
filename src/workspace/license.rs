@@ -1,16 +1,16 @@
 use crate::{
+    User,
     process::ProcessBuilderExt as _,
     workspace::{PackageExt as _, SourceExt as _},
-    User,
 };
-use anyhow::{anyhow, Context as _};
+use anyhow::{Context as _, anyhow};
 use cargo_metadata as cm;
 use cargo_util::ProcessBuilder;
 use maplit::btreeset;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{btree_map, BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map},
     path::Path,
 };
 
@@ -43,16 +43,6 @@ pub(super) fn read_non_unlicense_license_file(
             err
         }
     });
-
-    #[derive(Deserialize, Serialize)]
-    struct Owners {
-        #[serde(rename = "crates.io")]
-        crates_io: BTreeMap<String, BTreeMap<Version, BTreeSet<String>>>,
-        #[serde(rename = "github.com")]
-        github_com: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
-        #[serde(rename = "gitlab.com")]
-        gitlab_com: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
-    }
 }
 
 fn users(package: &cm::Package, cache_dir: &Path) -> anyhow::Result<BTreeSet<User>> {
@@ -68,7 +58,7 @@ fn users(package: &cm::Package, cache_dir: &Path) -> anyhow::Result<BTreeSet<Use
         if source.is_crates_io() {
             match cache
                 .crates_io
-                .entry(package.name.clone())
+                .entry(package.name.to_string())
                 .or_default()
                 .entry(package.version.clone())
             {
@@ -93,7 +83,7 @@ fn users(package: &cm::Package, cache_dir: &Path) -> anyhow::Result<BTreeSet<Use
         {
             cache
                 .github_com
-                .entry(package.name.clone())
+                .entry(package.name.to_string())
                 .or_default()
                 .entry((*rev).to_owned())
                 .or_default()
@@ -107,7 +97,7 @@ fn users(package: &cm::Package, cache_dir: &Path) -> anyhow::Result<BTreeSet<Use
         {
             cache
                 .gitlab_com
-                .entry(package.name.clone())
+                .entry(package.name.to_string())
                 .or_default()
                 .entry((*rev).to_owned())
                 .or_default()
@@ -238,7 +228,7 @@ fn read(package: &cm::Package, cache_dir: &Path) -> Result<Option<String>, Vec<S
 
                 let cache_path = &cache_dir
                     .join("license-files")
-                    .join(&package.name)
+                    .join(package.name.as_str())
                     .join(&sha1);
 
                 if cache_path.exists() {

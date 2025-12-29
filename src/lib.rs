@@ -16,21 +16,20 @@ use crate::{
     rust::CodeEdit,
     shell::Shell,
     workspace::{
-        Edition, MetadataExt as _, PackageExt as _, PackageIdExt as _, ResolveBehavior,
-        TargetExt as _,
+        MetadataExt as _, PackageExt as _, PackageIdExt as _, ResolveBehavior, TargetExt as _,
     },
 };
 use anyhow::Context as _;
-use cargo_metadata as cm;
+use cargo_metadata::{self as cm, Edition};
 use indoc::indoc;
-use itertools::{iproduct, Itertools as _};
-use krates::PkgSpec;
+use itertools::{Itertools as _, iproduct};
+use krates::{ParsedFeature, PkgSpec};
 use maplit::{btreeset, hashmap, hashset};
 use petgraph::{
     graph::{Graph, NodeIndex},
     visit::Dfs,
 };
-use prettytable::{cell, format::FormatBuilder, row, Table};
+use prettytable::{Table, cell, format::FormatBuilder, row};
 use quote::quote;
 use std::{
     cmp,
@@ -40,7 +39,7 @@ use std::{
     rc::Rc,
     str::FromStr,
 };
-use structopt::{clap::AppSettings, StructOpt};
+use structopt::{StructOpt, clap::AppSettings};
 
 // We need to prepend " " to `long_help`s.
 // https://github.com/BurntSushi/ripgrep/blob/9eddb71b8e86a04d7048b920b9b50a2e97068d03/crates/core/app.rs#L533-L539
@@ -585,7 +584,7 @@ pub fn run(opt: Opt, ctx: Context<'_>) -> anyhow::Result<()> {
         metadata.exactly_one_target()
     }?;
 
-    if root_package.edition() == Edition::Edition2015 {
+    if root_package.edition() == Edition::E2015 {
         shell.warn("Rust 2015 is unsupported")?;
     }
     let resolve_behavior = workspace::resolve_behavior(root_package, &metadata.workspace_root)?;
@@ -884,7 +883,7 @@ fn bundle(
                 let lib_package: &cm::Package = &metadata[lib_package];
 
                 if let Some(names) = proc_macro_names.get(&lib_package.id) {
-                    debug_assert_eq!(["proc-macro".to_owned()], *lib_target.kind);
+                    debug_assert_eq!(vec![cargo_metadata::TargetKind::ProcMacro], lib_target.kind);
                     let names = names
                         .iter()
                         .map(|name| {
@@ -976,7 +975,12 @@ fn bundle(
                     },
                 )?;
                 if resolve_cfgs {
-                    edit.resolve_cfgs(features)?;
+                    edit.resolve_cfgs(
+                        &features
+                            .iter()
+                            .map(|s| ParsedFeature::from(s.as_str()).feat())
+                            .collect::<Vec<_>>(),
+                    )?;
                 }
                 if remove.contains(&Remove::Docs) {
                     edit.allow_missing_docs();
@@ -1268,7 +1272,7 @@ fn bundle(
         code = rustfmt::rustfmt(
             &metadata.workspace_root,
             &code,
-            &root_crate.package().edition,
+            root_crate.package().edition.as_str(),
         )?;
     }
 

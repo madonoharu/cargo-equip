@@ -1,12 +1,13 @@
 use crate::{ra_proc_macro::ProcMacroExpander, shell::Shell};
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{Context as _, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use fixedbitset::FixedBitSet;
 use if_chain::if_chain;
 use itertools::Itertools as _;
+use krates::{Feature, ParsedFeature};
 use maplit::btreemap;
 use proc_macro2::{LineColumn, Span, TokenStream, TokenTree};
-use quote::{quote, ToTokens};
+use quote::{ToTokens, quote};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -15,11 +16,6 @@ use std::{
     str,
 };
 use syn::{
-    parse::{ParseStream, Parser as _},
-    parse_quote,
-    punctuated::{Pair, Punctuated},
-    spanned::Spanned,
-    visit::{self, Visit},
     Arm, AttrStyle, Attribute, BareFnArg, ConstParam, Expr, ExprArray, ExprAssign, ExprAssignOp,
     ExprAsync, ExprAwait, ExprBinary, ExprBlock, ExprBox, ExprBreak, ExprCall, ExprCast,
     ExprClosure, ExprContinue, ExprField, ExprForLoop, ExprGroup, ExprIf, ExprIndex, ExprLet,
@@ -35,6 +31,11 @@ use syn::{
     PatWild, PathSegment, Receiver, Token, TraitItemConst, TraitItemMacro, TraitItemMethod,
     TraitItemType, TypeParam, UseGroup, UseName, UsePath, UseRename, UseTree, Variadic, Variant,
     VisRestricted,
+    parse::{ParseStream, Parser as _},
+    parse_quote,
+    punctuated::{Pair, Punctuated},
+    spanned::Spanned,
+    visit::{self, Visit},
 };
 
 pub(crate) fn find_skip_attribute(code: &str) -> anyhow::Result<bool> {
@@ -1372,7 +1373,7 @@ impl<'opt> CodeEdit<'opt> {
         Ok(prelude)
     }
 
-    pub(crate) fn resolve_cfgs(&mut self, features: &[String]) -> anyhow::Result<()> {
+    pub(crate) fn resolve_cfgs(&mut self, features: &[Feature<'_>]) -> anyhow::Result<()> {
         self.apply()?;
         Visitor {
             replacements: &mut self.replacements,
@@ -1383,7 +1384,7 @@ impl<'opt> CodeEdit<'opt> {
 
         struct Visitor<'a> {
             replacements: &'a mut BTreeMap<(LineColumn, LineColumn), String>,
-            features: &'a [String],
+            features: &'a [Feature<'a>],
         }
 
         impl Visitor<'_> {
@@ -1414,7 +1415,8 @@ impl<'opt> CodeEdit<'opt> {
                             }
                             cfg_expr::Predicate::Flag("cargo_equip") => Some(true),
                             cfg_expr::Predicate::Feature(feature) => {
-                                Some(self.features.contains(&(*feature).to_owned()))
+                                let feature = ParsedFeature::from(*feature);
+                                Some(self.features.contains(&feature.feat()))
                             }
                             _ => None,
                         });
