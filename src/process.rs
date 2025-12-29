@@ -4,9 +4,9 @@ use std::{env, fmt, io, path::PathBuf, process::Stdio};
 
 pub(crate) fn cargo_exe() -> anyhow::Result<PathBuf> {
     env::var_os("CARGO")
-        .with_context(|| {
-            "missing `$CARGO`. run this program with `cargo equip`, not `cargo-equip equip`"
-        })
+        .with_context(
+            || "missing `$CARGO`. run this program with `cargo equip`, not `cargo-equip equip`",
+        )
         .map(Into::into)
 }
 
@@ -17,16 +17,11 @@ pub(crate) trait ProcessBuilderExt: fmt::Display {
     }
 
     fn read_stdout<O: StdoutOutput>(&self) -> anyhow::Result<O>;
-    fn read_stdout_unchecked<O: StdoutOutput>(&self) -> anyhow::Result<O>;
 }
 
 impl ProcessBuilderExt for cargo_util::ProcessBuilder {
     fn read_stdout<O: StdoutOutput>(&self) -> anyhow::Result<O> {
         O::read_stdout(self, true)
-    }
-
-    fn read_stdout_unchecked<O: StdoutOutput>(&self) -> anyhow::Result<O> {
-        O::read_stdout(self, false)
     }
 }
 

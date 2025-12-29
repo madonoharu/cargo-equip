@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
-#![warn(rust_2018_idioms)]
 #![recursion_limit = "256"]
 
-mod cargo_udeps;
 mod process;
 mod ra_proc_macro;
 mod rust;
@@ -164,14 +162,6 @@ pub struct OptEquip {
         )
     )]
     mine: Vec<User>,
-
-    /// [Deprecated] Alias for `--toolchain-for-udeps`
-    #[structopt(long, value_name("TOOLCHAIN"), conflicts_with("toolchain_for_udeps"))]
-    toolchain: Option<String>,
-
-    /// `nightly` toolchain for `cargo-udeps`
-    #[structopt(long, value_name("TOOLCHAIN"), default_value("nightly"))]
-    toolchain_for_udeps: String,
 
     /// Toolchain for expanding procedural macros
     #[structopt(long, value_name("TOOLCHAIN"))]
@@ -533,8 +523,6 @@ pub fn run(opt: Opt, ctx: Context<'_>) -> anyhow::Result<()> {
         exclude_atcoder_202301_crates,
         exclude_codingame_crates,
         mine,
-        toolchain: deprecated_toolchain_opt,
-        toolchain_for_udeps,
         toolchain_for_proc_macro_srv,
         mod_path: CrateSinglePath(cargo_equip_mod_name),
         remove,
@@ -568,19 +556,12 @@ pub fn run(opt: Opt, ctx: Context<'_>) -> anyhow::Result<()> {
         exclude
     };
 
-    let toolchain_for_udeps = deprecated_toolchain_opt
-        .as_ref()
-        .unwrap_or(&toolchain_for_udeps);
-
     let Context {
         cwd,
         cache_dir,
         shell,
     } = ctx;
 
-    if deprecated_toolchain_opt.is_some() {
-        shell.warn("`--toolchain` was renamed to `--toolchain-for-udeps`")?;
-    }
     if deprecated_resolve_cfgs_flag {
         shell.warn("`--resolve-cfgs` is deprecated. `#[cfg(..)]`s are resolved by default")?;
     }
@@ -623,19 +604,9 @@ pub fn run(opt: Opt, ctx: Context<'_>) -> anyhow::Result<()> {
     }
 
     let libs_to_bundle = {
-        let unused_deps = &if root.is_lib() {
-            hashset!()
-        } else {
-            match cargo_udeps::cargo_udeps(root_package, root, toolchain_for_udeps, shell) {
-                Ok(unused_deps) => unused_deps,
-                Err(warning) => {
-                    shell.warn(warning)?;
-                    hashset!()
-                }
-            }
-        };
+        let unused_deps = hashset!();
         let mut libs_to_bundle =
-            metadata.libs_to_bundle(&root_package.id, root.is_example(), unused_deps, &exclude)?;
+            metadata.libs_to_bundle(&root_package.id, root.is_example(), &unused_deps, &exclude)?;
         if root.is_lib() {
             libs_to_bundle.insert(&root_package.id, (root, root.crate_name()));
         }

@@ -1,6 +1,6 @@
 [package]
 name = "cargo-equip"
-version = "0.20.4"
+version = "0.21.0"
 edition = "2024"
 description = "A Cargo subcommand to bundle your code into one `.rs` file for competitive programming."
 repository = "https://github.com/madonoharu/cargo-equip"
@@ -13,7 +13,7 @@ anyhow = "1"
 atty = "0.2.14"
 camino = { version = "1.1.6", features = ["serde1"] }
 cargo_metadata = "0.19"
-cargo-util = "0.2"
+cargo-util = "=0.2.24"
 cfg-expr = "0.20"
 derive_more = "0.99.17"
 dirs-next = "2.0.0"
