@@ -10,7 +10,6 @@ use indoc::indoc;
 use itertools::Itertools as _;
 use krates::PkgSpec;
 use rand::Rng as _;
-use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
@@ -36,28 +35,6 @@ pub(crate) fn cargo_metadata(manifest_path: &Path, cwd: &Path) -> cm::Result<cm:
         .manifest_path(manifest_path)
         .current_dir(cwd)
         .exec()
-}
-
-pub(crate) fn resolve_behavior(
-    package: &cm::Package,
-    workspace_root: &Utf8Path,
-) -> anyhow::Result<ResolveBehavior> {
-    let cargo_toml = &cargo_util::paths::read(workspace_root.join("Cargo.toml").as_ref())?;
-    let CargoToml { workspace } = toml::from_str(cargo_toml)?;
-    return Ok(workspace
-        .resolver
-        .unwrap_or_else(|| ResolveBehavior::default_from(package.edition)));
-
-    #[derive(Deserialize)]
-    struct CargoToml {
-        #[serde(default)]
-        workspace: Workspace,
-    }
-
-    #[derive(Default, Deserialize)]
-    struct Workspace {
-        resolver: Option<ResolveBehavior>,
-    }
 }
 
 pub(crate) fn cargo_check_message_format_json(
@@ -751,28 +728,6 @@ impl SourceExt for cm::Source {
         match *url.split('#').collect::<Vec<_>>() {
             [url, rev] => Some((url, rev)),
             _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, PartialOrd, Deserialize)]
-pub(crate) enum ResolveBehavior {
-    #[serde(rename = "1")]
-    V1,
-    #[serde(rename = "2")]
-    V2,
-    #[serde(rename = "3")]
-    V3,
-}
-
-impl ResolveBehavior {
-    fn default_from(edition: Edition) -> ResolveBehavior {
-        use Edition::*;
-
-        match edition {
-            E2015 | E2018 => ResolveBehavior::V1,
-            E2021 => ResolveBehavior::V2,
-            _ => ResolveBehavior::V3,
         }
     }
 }

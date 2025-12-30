@@ -1,7 +1,6 @@
 use crate::shell::Shell;
 use anyhow::{Context as _, Ok, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
-use cfg_expr::expr::Logic;
 use fixedbitset::FixedBitSet;
 use if_chain::if_chain;
 use itertools::Itertools as _;
@@ -11,7 +10,7 @@ use proc_macro2::{LineColumn, Span, TokenStream, TokenTree};
 use quote::{ToTokens, quote};
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     env, mem,
     str,
 };
@@ -161,7 +160,7 @@ pub(crate) fn insert_prelude_for_main_crate(
                 self.replacements.insert(
                     (pos, pos),
                     format!(
-                        "pub use {}{}::prelude::*;\n\n",
+                        "use {}{}::*;\n\n",
                         if crate_root { "" } else { "crate::" },
                         self.cargo_equip_mod_name,
                     ),
@@ -228,7 +227,6 @@ pub(crate) fn process_bin<'cm>(
 
 pub(crate) struct CodeEdit<'opt> {
     cargo_equip_mod_name: &'opt Ident,
-    has_local_inner_macros_attr: bool,
     string: String,
     file: syn::File,
     replacements: BTreeMap<(LineColumn, LineColumn), String>,
@@ -321,47 +319,10 @@ impl<'opt> CodeEdit<'opt> {
         let file = syn::parse_file(string)?;
         return syn::Result::Ok(Self {
             cargo_equip_mod_name,
-            has_local_inner_macros_attr: check_local_inner_macros(&file),
             string: string.to_owned(),
             file,
             replacements: btreemap!(),
         });
-
-        fn check_local_inner_macros(file: &syn::File) -> bool {
-            let mut out = false;
-            Visitor { out: &mut out }.visit_file(file);
-            return out;
-
-            struct Visitor<'a> {
-                out: &'a mut bool,
-            }
-
-            impl Visit<'_> for Visitor<'_> {
-                fn visit_item_macro(&mut self, i: &ItemMacro) {
-                    *self.out |= i
-                        .attrs
-                        .iter()
-                        .filter(|a| a.path().is_ident("macro_export"))
-                        .any(|a| {
-                            let mut r = false;
-
-                            a.parse_nested_meta(|m| {
-                                if m.path.is_ident("local_inner_macros") {
-                                    r = true;
-                                }
-
-                                syn::Result::Ok(())
-                            })
-                            .is_ok()
-                            .and(r)
-                        });
-                }
-            }
-        }
-    }
-
-    pub(crate) fn has_local_inner_macros_attr(&self) -> bool {
-        self.has_local_inner_macros_attr
     }
 
     pub(crate) fn finish(mut self) -> anyhow::Result<String> {
@@ -423,20 +384,20 @@ impl<'opt> CodeEdit<'opt> {
                     if let Some((_, rename)) = rename {
                         if rename != "_" {
                             insertion = format!(
-                                "{} use crate::{}::crates::{} as {};",
+                                "{} use crate::{}::{} as {};",
                                 vis, self.cargo_equip_mod_name, ident, rename
                             );
                         }
                     } else {
                         insertion = format!(
-                            "{} use crate::{}::crates::{};",
+                            "{} use crate::{}::{};",
                             vis, self.cargo_equip_mod_name, ident,
                         );
                     }
 
                     if is_macro_use {
                         insertion += &format!(
-                            "{} use crate::{}::macros::{}::*;",
+                            "{} use crate::{}::{}::*;",
                             vis, self.cargo_equip_mod_name, ident,
                         );
                     }
@@ -513,12 +474,12 @@ impl<'opt> CodeEdit<'opt> {
                         (item_use.span().start(), semi_token.span().end()),
                         if let Some((_, rename)) = rename {
                             quote!(
-                                #(#attrs)* #vis use crate::#cargo_equip_mod_name::crates::#to as #rename;
+                                #(#attrs)* #vis use crate::#cargo_equip_mod_name::#to as #rename;
                             )
                             .to_string()
                         } else {
                             quote!(
-                                #(#attrs)* #vis use crate::#cargo_equip_mod_name::crates::#to as #ident;
+                                #(#attrs)* #vis use crate::#cargo_equip_mod_name::#to as #ident;
                             )
                             .to_string()
                         },
@@ -629,7 +590,7 @@ impl<'opt> CodeEdit<'opt> {
                 {
                     self.replacements.insert(
                         (leading_colon.start(), leading_colon.end()),
-                        format!("/*::*/crate::{}::crates::", self.cargo_equip_mod_name),
+                        format!("/*::*/crate::{}::", self.cargo_equip_mod_name),
                     );
 
                     if extern_crate_name != &*pseudo_extern_crate_name {
@@ -700,7 +661,7 @@ impl<'opt> CodeEdit<'opt> {
                 self.replacements.insert(
                     (pos, pos),
                     format!(
-                        "::{}::crates::{}",
+                        "::{}::{}",
                         self.cargo_equip_mod_name, self.extern_crate_name,
                     ),
                 );
@@ -758,10 +719,8 @@ impl<'opt> CodeEdit<'opt> {
     pub(crate) fn modify_declarative_macros(
         &mut self,
         pseudo_extern_crate_name: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<()> {
         self.apply()?;
-
-        let mut macro_names = btreemap!();
 
         for item_macro in collect_item_macros(&self.file) {
             if let ItemMacro {
@@ -777,60 +736,23 @@ impl<'opt> CodeEdit<'opt> {
                     pseudo_extern_crate_name,
                     &mut self.replacements,
                 );
-                if attrs.iter().any(|a| a.path().is_ident("macro_export")) {
-                    let rename = format!(
-                        "{}_macro_def_{}_{}",
-                        self.cargo_equip_mod_name, pseudo_extern_crate_name, ident,
-                    );
-                    self.replacements.insert(
-                        (ident.span().start(), ident.span().end()),
-                        format!("/*{}*/{}", ident, rename),
-                    );
+
+                if attrs.iter().any(|a| a.path().is_ident("macro_export") ) {
+                    let rename = format!("__{pseudo_extern_crate_name}_{ident}");
                     let pos = item_macro.span().end();
                     self.replacements.insert(
-                        (pos, pos),
-                        format!(
-                            "\nmacro_rules!{}{{($($tt:tt)*)=>(crate::{}!{{$($tt)*}})}}",
-                            ident, rename,
-                        ),
+                        (ident.span().start(), ident.span().end()),
+                        rename.clone(),
                     );
-                    macro_names.insert(rename, ident);
+                    self.replacements.insert(
+                        (pos, pos),
+                        format!("\npub use {rename} as {ident};"),
+                    );
                 }
             }
         }
 
-        if !macro_names.is_empty() {
-            if let Some(first) = self.file.items.first() {
-                let pos = first.span().start();
-                self.replacements.entry((pos, pos)).or_default().insert_str(
-                    0,
-                    &format!(
-                        "pub use crate::{}::macros::{}::*;",
-                        self.cargo_equip_mod_name, pseudo_extern_crate_name,
-                    ),
-                );
-            }
-        }
-
-        let macro_mod_content = if macro_names.is_empty() {
-            "".to_owned()
-        } else {
-            format!(
-                "pub use crate::{}{}{};\n",
-                if macro_names.len() > 1 { "{" } else { "" },
-                macro_names
-                    .iter()
-                    .map(|(rename, name)| if *name == rename {
-                        name.to_string()
-                    } else {
-                        format!("{} as {}", rename, name)
-                    })
-                    .format(", "),
-                if macro_names.len() > 1 { "}" } else { "" },
-            )
-        };
-
-        return Ok(macro_mod_content);
+        return Ok(());
 
         fn collect_item_macros(file: &syn::File) -> Vec<&ItemMacro> {
             let mut acc = vec![];
@@ -884,123 +806,13 @@ impl<'opt> CodeEdit<'opt> {
                     acc.insert(
                         (pos, pos),
                         format!(
-                            "::{}::crates::{}",
+                            "::{}::{}",
                             cargo_equip_mod_name, pseudo_extern_crate_name,
                         ),
                     );
                 }
             }
         }
-    }
-
-    pub(crate) fn resolve_pseudo_prelude(
-        &mut self,
-        pseudo_extern_crate_name: &str,
-        libs_with_local_inner_macros: &BTreeSet<&str>,
-        extern_crate_name_translation: &BTreeMap<String, String>,
-    ) -> anyhow::Result<String> {
-        if extern_crate_name_translation.is_empty() && libs_with_local_inner_macros.is_empty() {
-            return Ok("".to_owned());
-        }
-
-        self.apply()?;
-
-        let syn::File { attrs, items, .. } = &self.file;
-
-        let external_local_inner_macros = {
-            let macros = libs_with_local_inner_macros
-                .iter()
-                .map(|name| format!("{}::*", name))
-                .join(", ");
-            match libs_with_local_inner_macros.len() {
-                0 => None,
-                1 => Some(macros),
-                _ => Some(format!("{{{}}}", macros)),
-            }
-        };
-
-        let pseudo_extern_crates = {
-            let uses = extern_crate_name_translation
-                .iter()
-                .map(|(extern_crate_name, pseudo_extern_crate_name)| {
-                    if extern_crate_name == pseudo_extern_crate_name {
-                        extern_crate_name.clone()
-                    } else {
-                        format!("{} as {}", pseudo_extern_crate_name, extern_crate_name)
-                    }
-                })
-                .join(", ");
-            match extern_crate_name_translation.len() {
-                0 => None,
-                1 => Some(uses),
-                _ => Some(format!("{{{}}}", uses)),
-            }
-        };
-
-        let mut prelude = "".to_owned();
-        if let Some(external_local_inner_macros) = &external_local_inner_macros {
-            prelude += &format!(
-                "pub(in crate::{0}) use crate::{0}::macros::{1};",
-                self.cargo_equip_mod_name, external_local_inner_macros,
-            );
-        }
-        if let Some(pseudo_extern_crates) = &pseudo_extern_crates {
-            prelude += &format!(
-                "pub(in crate::{0}) use crate::{0}::crates::{1};",
-                self.cargo_equip_mod_name, pseudo_extern_crates,
-            );
-        }
-
-        self.replacements.insert(
-            {
-                let pos = if let Some(item) = items.first() {
-                    item.span().start()
-                } else if let Some(attr) = attrs.last() {
-                    attr.span().end()
-                } else {
-                    LineColumn { line: 0, column: 0 }
-                };
-                (pos, pos)
-            },
-            {
-                format!(
-                    "use crate::{}::preludes::{}::*;",
-                    self.cargo_equip_mod_name, pseudo_extern_crate_name,
-                )
-            },
-        );
-
-        let mut queue = items
-            .iter()
-            .flat_map(|item| match item {
-                Item::Mod(item_mod) => Some((1, item_mod)),
-                _ => None,
-            })
-            .collect::<VecDeque<_>>();
-
-        while let Some((depth, ItemMod { attrs, content, .. })) = queue.pop_front() {
-            let (_, items) = content.as_ref().expect("should be expanded");
-            let pos = if let Some(item) = items.first() {
-                item.span().start()
-            } else if let Some(attr) = attrs.last() {
-                attr.span().end()
-            } else {
-                LineColumn { line: 0, column: 0 }
-            };
-            self.replacements.insert(
-                (pos, pos),
-                format!(
-                    "use crate::{}::preludes::{}::*;",
-                    self.cargo_equip_mod_name, pseudo_extern_crate_name,
-                ),
-            );
-            for item in items {
-                if let Item::Mod(item_mod) = item {
-                    queue.push_back((depth + 1, item_mod));
-                }
-            }
-        }
-        Ok(prelude)
     }
 
     pub(crate) fn resolve_cfgs(&mut self, features: &[Feature<'_>]) -> anyhow::Result<()> {

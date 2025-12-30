@@ -1,6 +1,6 @@
 [package]
 name = "cargo-equip"
-version = "0.21.0"
+version = "0.21.2"
 edition = "2024"
 description = "A Cargo subcommand to bundle your code into one `.rs` file for competitive programming."
 repository = "https://github.com/madonoharu/cargo-equip"
@@ -23,7 +23,6 @@ indoc = "2"
 itertools = "0.14"
 krates = { version = "0.20", features = ["metadata"] }
 maplit = "1.0.2"
-petgraph = "0.8"
 prettytable-rs = "0.10.0"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"

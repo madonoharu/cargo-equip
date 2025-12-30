@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![recursion_limit = "256"]
+#![allow(unused)]
 
 mod process;
 mod rust;
@@ -11,26 +12,18 @@ mod workspace;
 use crate::{
     rust::CodeEdit,
     shell::Shell,
-    workspace::{
-        MetadataExt as _, PackageExt as _, PackageIdExt as _, ResolveBehavior, TargetExt as _,
-    },
+    workspace::{MetadataExt as _, PackageExt as _, TargetExt as _},
 };
 use anyhow::Context as _;
 use cargo_metadata::{self as cm, Edition};
 use indoc::indoc;
 use itertools::{Itertools as _, iproduct};
 use krates::{ParsedFeature, PkgSpec};
-use maplit::{btreeset, hashmap, hashset};
-use petgraph::{
-    graph::{Graph, NodeIndex},
-    visit::Dfs,
-};
-use prettytable::{Table, cell, format::FormatBuilder, row};
+use maplit::hashset;
 use std::{
-    cmp,
     collections::{BTreeMap, HashMap},
     fmt::Debug,
-    path::{Path, PathBuf},
+    path::PathBuf,
     rc::Rc,
     str::FromStr,
 };
@@ -592,13 +585,6 @@ pub fn run(opt: Opt, ctx: Context<'_>) -> anyhow::Result<()> {
     if root_package.edition() == Edition::E2015 {
         shell.warn("Rust 2015 is unsupported")?;
     }
-    let resolve_behavior = workspace::resolve_behavior(root_package, &metadata.workspace_root)?;
-    if resolve_behavior >= ResolveBehavior::V2 {
-        shell.warn(
-            "Currently cargo-equip only support Feature Resovler v1, and may go search more crates \
-             than real Cargo does. Please watch https://github.com/qryxip/cargo-equip/issues/94",
-        )?;
-    }
 
     let libs_to_bundle = {
         let unused_deps = hashset!();
@@ -618,7 +604,7 @@ pub fn run(opt: Opt, ctx: Context<'_>) -> anyhow::Result<()> {
             .iter()
             .map(|(package_id, (_, pseudo_extern_crate_name))| {
                 format!(
-                    "- `{}` as `crate::{}::crates::{}`\n",
+                    "- `{}` as `crate::{}::{}`\n",
                     package_id, cargo_equip_mod_name, pseudo_extern_crate_name,
                 )
             })
@@ -648,14 +634,12 @@ pub fn run(opt: Opt, ctx: Context<'_>) -> anyhow::Result<()> {
             RootCrate::BinLike(root_package, root)
         },
         &libs_to_bundle,
-        &mine,
         &cargo_equip_mod_name,
         !no_resolve_cfgs,
         &remove,
         minify,
         !no_rustfmt,
         toolchain_for_proc_macro_srv.as_deref(),
-        &cache_dir,
         shell,
     )
     .with_context(|| error_message("could not bundle the code"))?;
@@ -685,14 +669,12 @@ fn bundle(
     metadata: &cm::Metadata,
     root_crate: RootCrate<'_>,
     libs_to_bundle: &BTreeMap<&cm::PackageId, (&cm::Target, String)>,
-    mine: &[User],
     cargo_equip_mod_name: &syn::Ident,
     resolve_cfgs: bool,
     remove: &[Remove],
     minify: Minify,
     rustfmt: bool,
     toolchain_for_proc_macro_srv: Option<&str>,
-    cache_dir: &Path,
     shell: &mut Shell,
 ) -> anyhow::Result<String> {
     let cargo_check_message_format_json = |toolchain: &str, shell: &mut Shell| -> _ {
@@ -784,31 +766,6 @@ fn bundle(
         })
         .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
 
-    let (graph, indices) = normal_non_host_dep_graph(&resolve_nodes, libs_to_bundle);
-
-    let libs_with_local_inner_macros = {
-        let mut libs_with_local_inner_macros = libs
-            .keys()
-            .map(|pkg| (*pkg, btreeset!()))
-            .collect::<HashMap<_, _>>();
-        for (goal, (_, pseudo_extern_crate_name, edit)) in &libs {
-            if edit.has_local_inner_macros_attr() {
-                libs_with_local_inner_macros
-                    .get_mut(*goal)
-                    .unwrap()
-                    .insert(&**pseudo_extern_crate_name);
-                let mut dfs = Dfs::new(&graph, indices[goal]);
-                while let Some(next) = dfs.next(&graph) {
-                    libs_with_local_inner_macros
-                        .get_mut(graph[next])
-                        .unwrap()
-                        .insert(&**pseudo_extern_crate_name);
-                }
-            }
-        }
-        libs_with_local_inner_macros
-    };
-
     let libs = libs
         .into_iter()
         .map(
@@ -834,27 +791,8 @@ fn bundle(
                 edit.translate_crate_path(pseudo_extern_crate_name)?;
                 edit.translate_extern_crate_paths(translate_extern_crate_name)?;
                 edit.process_extern_crates_in_lib(translate_extern_crate_name, shell)?;
-                let macro_mod_content = edit.modify_declarative_macros(pseudo_extern_crate_name)?;
-                let prelude_mod_content = edit.resolve_pseudo_prelude(
-                    pseudo_extern_crate_name,
-                    &libs_with_local_inner_macros[&lib_package.id],
-                    &{
-                        metadata
-                            .libs_with_extern_crate_names(
-                                &lib_package.id,
-                                &libs_to_bundle.keys().copied().collect(),
-                            )?
-                            .into_iter()
-                            .map(|(package_id, extern_crate_name)| {
-                                let (_, pseudo_extern_crate_name) =
-                                libs_to_bundle.get(package_id).with_context(|| {
-                                    "could not translate pseudo extern crate names. this is a bug"
-                                })?;
-                                Ok((extern_crate_name, pseudo_extern_crate_name.clone()))
-                            })
-                            .collect::<anyhow::Result<_>>()?
-                    },
-                )?;
+                edit.modify_declarative_macros(pseudo_extern_crate_name)?;
+
                 if resolve_cfgs {
                     edit.resolve_cfgs(
                         &features
@@ -873,18 +811,10 @@ fn bundle(
 
                 let crate_mod_content = edit.finish()?;
 
-                Ok((
-                    pseudo_extern_crate_name,
-                    (
-                        lib_package,
-                        crate_mod_content,
-                        macro_mod_content,
-                        prelude_mod_content,
-                    ),
-                ))
+                Ok((pseudo_extern_crate_name, (lib_package, crate_mod_content)))
             },
         )
-        .collect::<anyhow::Result<Vec<(&str, (&cm::Package, String, String, String))>>>()?;
+        .collect::<anyhow::Result<Vec<(&str, (&cm::Package, String))>>>()?;
 
     if !libs.is_empty() {
         if !root_crate.package().authors.is_empty() {
@@ -896,157 +826,24 @@ fn bundle(
 
         code = rust::insert_prelude_for_main_crate(&code, cargo_equip_mod_name)?;
 
-        let doc = &{
-            fn list_packages<'a>(
-                doc: &mut String,
-                title: &str,
-                cargo_equip_mod_name: &syn::Ident,
-                contents: impl Iterator<Item = (Option<&'a str>, &'a cm::Package)>,
-            ) {
-                let mut table = Table::new();
-
-                *table.get_format() = FormatBuilder::new()
-                    .column_separator(' ')
-                    .borders(' ')
-                    .build();
-
-                let contents = contents.collect::<Vec<_>>();
-                let any_from_local_filesystem = contents.iter().any(|(_, p)| p.source.is_none());
-
-                for (pseudo_extern_crate_name, package) in contents {
-                    let mut row = row![format!("- `{}`", package.id.mask_path())];
-
-                    if any_from_local_filesystem {
-                        row.add_cell(if package.source.is_some() {
-                            cell!("")
-                        } else if let Some(repository) = &package.repository {
-                            cell!(format!("published in {}", repository))
-                        } else {
-                            cell!("published in **missing**")
-                        });
-                    }
-
-                    row.add_cell(if let Some(license) = &package.license {
-                        cell!(format!("licensed under `{}`", license))
-                    } else {
-                        cell!("licensed under **missing**")
-                    });
-
-                    if let Some(pseudo_extern_crate_name) = pseudo_extern_crate_name {
-                        row.add_cell(cell!(format!(
-                            "as `crate::{}::crates::{}`",
-                            cargo_equip_mod_name, pseudo_extern_crate_name,
-                        )));
-                    }
-
-                    table.add_row(row);
-                }
-
-                if !table.is_empty() {
-                    if !doc.is_empty() {
-                        *doc += "\n";
-                    }
-                    *doc += &format!(" # {}\n\n", title);
-                    for line in table.to_string().lines() {
-                        *doc += line.trim_end();
-                        *doc += "\n";
-                    }
-                }
-            }
-
-            let mut doc = "".to_owned();
-
-            list_packages(
-                &mut doc,
-                "Bundled libraries",
-                cargo_equip_mod_name,
-                libs.iter()
-                    .filter(|(_, (p, _, _, _))| p.has_lib())
-                    .map(|(k, (p, _, _, _))| (Some(*k), *p)),
-            );
-
-            list_packages(
-                &mut doc,
-                "Procedural macros",
-                cargo_equip_mod_name,
-                libs.iter()
-                    .filter(|(_, (p, _, _, _))| p.has_proc_macro())
-                    .map(|(_, (p, _, _, _))| (None, *p)),
-            );
-
-            let notices = libs
-                .iter()
-                .filter(|(_, (p, _, _, _))| {
-                    p.has_lib() && !metadata.workspace_members.contains(&p.id)
-                })
-                .map(|(_, (lib_package, _, _, _))| {
-                    shell.status("Checking", format!("the license of `{}`", lib_package.id))?;
-                    lib_package
-                        .read_license_text(mine, cache_dir)
-                        .map(|license_text| {
-                            license_text.map(|license_text| (&lib_package.id, license_text))
-                        })
-                })
-                .flat_map(Result::transpose)
-                .collect::<Result<Vec<_>, _>>()?;
-
-            if !notices.is_empty() {
-                doc += "\n # License and Copyright Notices\n";
-                for (package_id, license_text) in notices {
-                    doc += &format!("\n - `{}`\n\n", package_id.mask_path());
-                    let backquotes = {
-                        let (mut n, mut m) = (2, None);
-                        for c in license_text.chars() {
-                            if c == '`' {
-                                m = Some(m.unwrap_or(0) + 1);
-                            } else if let Some(m) = m.take() {
-                                n = cmp::max(n, m);
-                            }
-                        }
-                        "`".repeat(cmp::max(n, m.unwrap_or(0)) + 1)
-                    };
-                    doc += &format!("     {}text\n", backquotes);
-                    for line in license_text.lines() {
-                        match line {
-                            "" => doc += "\n",
-                            line => doc += &format!("     {}\n", line),
-                        }
-                    }
-                    doc += &format!("     {}\n", backquotes);
-                }
-            }
-
-            doc
-        };
-
         code += "\n";
         code += &match root_crate {
             RootCrate::BinLike(..) => {
                 "// The following code was expanded by `cargo-equip`.\n".to_owned()
             }
-            RootCrate::Lib(..) => format!("use {}::prelude::*;\n", cargo_equip_mod_name),
+            RootCrate::Lib(..) => format!("use {}::*;\n", cargo_equip_mod_name),
         };
         code += "\n";
 
         let crate_mods = libs
             .iter()
-            .map(|(name, (_, content, _, _))| (*name, &**content))
-            .collect::<Vec<_>>();
-
-        let macro_mods = libs
-            .iter()
-            .map(|(name, (_, _, content, _))| (*name, &**content))
-            .collect::<Vec<_>>();
-
-        let prelude_mods = libs
-            .iter()
-            .map(|(name, (_, _, _, content))| (*name, &**content))
+            .map(|(name, (_, content))| (*name, &**content))
             .collect::<Vec<_>>();
 
         let render_mods = |code: &mut String, mods: &[(&str, &str)]| -> anyhow::Result<()> {
             if minify == Minify::Libs {
                 for (pseudo_extern_crate_name, mod_content) in mods {
-                    *code += "        pub mod ";
+                    *code += "    pub mod ";
                     *code += pseudo_extern_crate_name;
                     *code += " {";
                     *code += &rustminify::minify_file(&rust::parse_file(mod_content)?);
@@ -1057,83 +854,22 @@ fn bundle(
                     if i > 0 {
                         *code += "\n";
                     }
-                    *code += "        pub mod ";
+                    *code += "    pub mod ";
                     *code += pseudo_extern_crate_name;
                     *code += " {\n";
                     *code += &rust::indent_code(mod_content, 3);
-                    *code += "    }\n";
+                    *code += "}\n";
                 }
             }
             Ok(())
         };
 
-        for doc in doc.lines() {
-            code += "///";
-            if !code.is_empty() {
-                code += " ";
-            }
-            code += doc;
-            code += "\n";
-        }
         if minify == Minify::Libs {
             code += "#[cfg_attr(any(), rustfmt::skip)]\n";
         }
         code += "#[allow(unused)]\n";
         code += &format!("mod {} {{\n", cargo_equip_mod_name);
-        code += "    pub(crate) mod crates {\n";
         render_mods(&mut code, &crate_mods)?;
-        code += "    }\n";
-        code += "\n";
-        code += "    pub(crate) mod macros {\n";
-        render_mods(&mut code, &macro_mods)?;
-        code += "    }\n";
-        code += "\n";
-        code += "    pub(crate) mod prelude {";
-        match root_crate {
-            RootCrate::BinLike(..) => {
-                let prelude_for_main = {
-                    let local_macro_uses_in_main_crate = libs_with_local_inner_macros
-                        .values()
-                        .flatten()
-                        .unique()
-                        .sorted()
-                        .map(|name| format!("{}::*", name))
-                        .collect::<Vec<_>>();
-
-                    let local_macro_uses_in_main_crate = match &*local_macro_uses_in_main_crate {
-                        [] => None,
-                        [part] => Some(part.clone()),
-                        parts => Some(format!("{{{}}}", parts.iter().format(","))),
-                    };
-
-                    format!(
-                        "pub use crate::{}::{};",
-                        cargo_equip_mod_name,
-                        if let Some(local_macro_uses_in_main_crate) = local_macro_uses_in_main_crate
-                        {
-                            format!("{{crates::*,macros::{}}}", local_macro_uses_in_main_crate)
-                        } else {
-                            "crates::*".to_owned()
-                        }
-                    )
-                };
-                code += &if minify == Minify::Libs {
-                    prelude_for_main
-                } else {
-                    format!("\n    {}\n    ", prelude_for_main)
-                };
-            }
-            RootCrate::Lib(_, krate) => {
-                code += &format!("pub use crate::{}::crates::", cargo_equip_mod_name);
-                code += &krate.crate_name();
-                code += ";";
-            }
-        }
-        code += "}\n";
-        code += "\n";
-        code += "    mod preludes {\n";
-        render_mods(&mut code, &prelude_mods)?;
-        code += "    }\n";
         code += "}\n";
     }
 
@@ -1150,38 +886,6 @@ fn bundle(
     }
 
     Ok(code)
-}
-
-fn normal_non_host_dep_graph<'cm>(
-    resolve_nodes: &HashMap<&'cm cm::PackageId, &cm::Node>,
-    libs_to_bundle: &BTreeMap<&'cm cm::PackageId, (&cm::Target, String)>,
-) -> (
-    Graph<&'cm cm::PackageId, ()>,
-    HashMap<&'cm cm::PackageId, NodeIndex>,
-) {
-    let mut graph = Graph::new();
-    let mut indices = hashmap!();
-    for pkg in libs_to_bundle.keys() {
-        indices.insert(*pkg, graph.add_node(*pkg));
-    }
-    for (from_pkg, (from_crate, _)) in libs_to_bundle {
-        if from_crate.is_lib() {
-            for cm::NodeDep {
-                pkg: to, dep_kinds, ..
-            } in &resolve_nodes[from_pkg].deps
-            {
-                if *from_pkg != to
-                    && dep_kinds
-                        .iter()
-                        .any(|cm::DepKindInfo { kind, .. }| *kind == cm::DependencyKind::Normal)
-                    && libs_to_bundle.contains_key(to)
-                {
-                    graph.add_edge(indices[to], indices[*from_pkg], ());
-                }
-            }
-        }
-    }
-    (graph, indices)
 }
 
 #[derive(Clone, Copy)]
