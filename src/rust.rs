@@ -1,6 +1,7 @@
-use crate::{ra_proc_macro::ProcMacroExpander, shell::Shell};
-use anyhow::{Context as _, anyhow, bail};
+use crate::shell::Shell;
+use anyhow::{Context as _, Ok, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
+use cfg_expr::expr::Logic;
 use fixedbitset::FixedBitSet;
 use if_chain::if_chain;
 use itertools::Itertools as _;
@@ -12,28 +13,27 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, mem,
-    ops::Range,
     str,
 };
 use syn::{
-    Arm, AttrStyle, Attribute, BareFnArg, ConstParam, Expr, ExprArray, ExprAssign, ExprAssignOp,
-    ExprAsync, ExprAwait, ExprBinary, ExprBlock, ExprBox, ExprBreak, ExprCall, ExprCast,
+    Arm, Attribute, BareFnArg, ConstParam, Expr, ExprArray, ExprAssign, 
+    ExprAsync, ExprAwait, ExprBinary, ExprBlock,  ExprBreak, ExprCall, ExprCast,
     ExprClosure, ExprContinue, ExprField, ExprForLoop, ExprGroup, ExprIf, ExprIndex, ExprLet,
     ExprLit, ExprLoop, ExprMacro, ExprMatch, ExprMethodCall, ExprParen, ExprPath, ExprRange,
-    ExprReference, ExprRepeat, ExprReturn, ExprStruct, ExprTry, ExprTryBlock, ExprTuple, ExprType,
+    ExprReference, ExprRepeat, ExprReturn, ExprStruct, ExprTry, ExprTryBlock, ExprTuple,
     ExprUnary, ExprUnsafe, ExprWhile, ExprYield, Field, FieldPat, FieldValue, ForeignItemFn,
     ForeignItemMacro, ForeignItemStatic, ForeignItemType, Ident, ImplItemConst, ImplItemMacro,
-    ImplItemMethod, ImplItemType, Item, ItemConst, ItemEnum, ItemExternCrate, ItemFn,
-    ItemForeignMod, ItemImpl, ItemMacro, ItemMacro2, ItemMod, ItemStatic, ItemStruct, ItemTrait,
-    ItemTraitAlias, ItemType, ItemUnion, ItemUse, LifetimeDef, Lit, LitStr, Local, Macro, Meta,
-    MetaList, MetaNameValue, NestedMeta, PatBox, PatIdent, PatLit, PatMacro, PatOr, PatPath,
-    PatRange, PatReference, PatRest, PatSlice, PatStruct, PatTuple, PatTupleStruct, PatType,
-    PatWild, PathSegment, Receiver, Token, TraitItemConst, TraitItemMacro, TraitItemMethod,
+    ImplItemType, Item, ItemConst, ItemEnum, ItemExternCrate, ItemFn,
+    ItemForeignMod, ItemImpl, ItemMacro,  ItemMod, ItemStatic, ItemStruct, ItemTrait,
+    ItemTraitAlias, ItemType, ItemUnion, ItemUse,  Lit, LitStr, Local, Macro, Meta,
+    MetaNameValue,  PatIdent,  PatOr,
+    PatReference, PatRest, PatSlice, PatStruct, PatTuple, PatTupleStruct, PatType,
+    PatWild, PathSegment, Receiver, Token, TraitItemConst, TraitItemMacro,
     TraitItemType, TypeParam, UseGroup, UseName, UsePath, UseRename, UseTree, Variadic, Variant,
     VisRestricted,
     parse::{ParseStream, Parser as _},
     parse_quote,
-    punctuated::{Pair, Punctuated},
+    punctuated::Punctuated,
     spanned::Spanned,
     visit::{self, Visit},
 };
@@ -45,24 +45,20 @@ pub(crate) fn find_skip_attribute(code: &str) -> anyhow::Result<bool> {
 
     Ok(attrs
         .iter()
-        .flat_map(Attribute::parse_meta)
-        .flat_map(|meta| match meta {
-            Meta::List(meta_list) => Some(meta_list),
-            _ => None,
-        })
-        .filter(|MetaList { path, .. }| path.is_ident("cfg_attr"))
-        .any(|MetaList { nested, .. }| {
+        .filter_map(|a| a.meta.require_list().ok())
+        .filter(|m| m.path.is_ident("cfg_attr"))
+        .any(|m| {
             matches!(
-                *nested.iter().collect::<Vec<_>>(),
+                m.tokens.clone().into_iter().collect::<Vec<_>>().as_slice(),
                 [pred, attr]
                 if matches!(
                     cfg_expr::Expression::parse(&pred.to_token_stream().to_string()),
-                    Ok(expr)
+                    Result::Ok(expr)
                     if expr.eval(|pred| match pred {
                         cfg_expr::Predicate::Flag("cargo_equip") => Some(true),
                         _ => None,
                     }) == Some(true)
-                ) && *attr == parse_quote!(cargo_equip::skip)
+                ) && attr.to_string() == "cargo_equip::skip"
             )
         }))
 }
@@ -140,7 +136,7 @@ fn replace_ranges(code: &str, replacements: BTreeMap<(LineColumn, LineColumn), S
     ret
 }
 
-pub(crate) fn insert_prelude_for_main_crate(
+pub(crate) fn insert_prelude_for_main_crate( 
     code: &str,
     cargo_equip_mod_name: &Ident,
 ) -> syn::Result<String> {
@@ -151,7 +147,7 @@ pub(crate) fn insert_prelude_for_main_crate(
         cargo_equip_mod_name,
     }
     .visit_file(file);
-    return Ok(replace_ranges(code, replacements));
+    return syn::Result::Ok(replace_ranges(code, replacements));
 
     struct Visitor<'a> {
         replacements: &'a mut BTreeMap<(LineColumn, LineColumn), String>,
@@ -192,78 +188,6 @@ pub(crate) fn insert_prelude_for_main_crate(
     }
 }
 
-pub(crate) fn allow_unused_imports_for_seemingly_proc_macros(
-    code: &str,
-    mut seemingly_proc_macro: impl FnMut(&str, &str) -> bool,
-) -> syn::Result<String> {
-    let file = &syn::parse_file(code)?;
-    let mut replacements = btreemap!();
-    Visitor {
-        replacements: &mut replacements,
-        seemingly_proc_macro: &mut seemingly_proc_macro,
-    }
-    .visit_file(file);
-    return Ok(if replacements.is_empty() {
-        code.to_owned()
-    } else {
-        replace_ranges(code, replacements)
-    });
-
-    struct Visitor<'a, P> {
-        replacements: &'a mut BTreeMap<(LineColumn, LineColumn), String>,
-        seemingly_proc_macro: P,
-    }
-
-    impl<P: FnMut(&str, &str) -> bool> Visit<'_> for Visitor<'_, P> {
-        fn visit_item_use(&mut self, i: &ItemUse) {
-            if let UseTree::Path(UsePath { ident, tree, .. }) = &i.tree {
-                match &**tree {
-                    UseTree::Name(name)
-                        if (self.seemingly_proc_macro)(
-                            &ident.to_string(),
-                            &name.ident.to_string(),
-                        ) =>
-                    {
-                        self.replacements.insert(
-                            (i.span().start(), i.span().start()),
-                            "#[allow(unused_imports)]\n".to_owned(),
-                        );
-                    }
-                    UseTree::Group(UseGroup { items, .. }) => {
-                        for pair in items.pairs() {
-                            let item = pair.value();
-                            if let UseTree::Name(name) = item {
-                                if (self.seemingly_proc_macro)(
-                                    &ident.to_string(),
-                                    &name.ident.to_string(),
-                                ) {
-                                    self.replacements.insert(
-                                        (pair.span().start(), pair.span().start()),
-                                        "/*".to_owned(),
-                                    );
-                                    self.replacements.insert(
-                                        (pair.span().end(), pair.span().end()),
-                                        "*/".to_owned(),
-                                    );
-                                    self.replacements.insert(
-                                        (i.span().end(), i.span().end()),
-                                        format!(
-                                            "\n#[allow(unused_imports)]\n{}use {}::{};",
-                                            (i.vis.to_token_stream().to_string() + " ").trim(),
-                                            ident,
-                                            name.ident,
-                                        ),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-}
 
 fn set_span(mask: &mut [FixedBitSet], span: Span, p: bool) {
     let i1 = span.start().line - 1;
@@ -292,15 +216,11 @@ pub(crate) fn parse_file(code: &str) -> anyhow::Result<syn::File> {
 pub(crate) fn process_bin<'cm>(
     cargo_equip_mod_name: &Ident,
     src_path: &Utf8Path,
-    proc_macro_expander: Option<&mut ProcMacroExpander<'_>>,
     translate_extern_crate_name: impl FnMut(&str) -> Option<String>,
     is_lib_to_bundle: impl FnMut(&str) -> bool,
     context: impl FnOnce() -> (String, &'cm str),
 ) -> anyhow::Result<String> {
     let mut edit = CodeEdit::new(cargo_equip_mod_name, src_path, context)?;
-    if let Some(proc_macro_expander) = proc_macro_expander {
-        edit.expand_proc_macros(proc_macro_expander)?;
-    }
     edit.translate_extern_crate_paths(translate_extern_crate_name)?;
     edit.process_extern_crate_in_bin(is_lib_to_bundle)?;
     edit.finish()
@@ -350,20 +270,16 @@ impl<'opt> CodeEdit<'opt> {
                 })
                 .map(|(attrs, ident, semi)| {
                     let paths = if let Some(path) = attrs
-                        .iter()
-                        .flat_map(Attribute::parse_meta)
-                        .flat_map(|meta| match meta {
-                            Meta::NameValue(name_value) => Some(name_value),
-                            _ => None,
-                        })
+                        .iter().filter_map(|a| a.meta.require_name_value().ok())
                         .filter(|MetaNameValue { path, .. }| {
                             matches!(path.get_ident(), Some(i) if i == "path")
                         })
-                        .find_map(|MetaNameValue { lit, .. }| match lit {
-                            Lit::Str(s) => Some(s.value()),
+                        .find_map(|m| match &m.value {
+                            Expr::Path(p) => Some(p),
                             _ => None,
                         }) {
-                        vec![src_path.with_file_name("").join(path)]
+                            
+                        vec![src_path.with_file_name("").join(path.to_token_stream().to_string())]
                     } else if depth == 0 || src_path.file_name() == Some("mod.rs") {
                         vec![
                             src_path
@@ -403,7 +319,7 @@ impl<'opt> CodeEdit<'opt> {
 
     fn from_code(cargo_equip_mod_name: &'opt Ident, string: &str) -> syn::Result<Self> {
         let file = syn::parse_file(string)?;
-        return Ok(Self {
+        return syn::Result::Ok(Self {
             cargo_equip_mod_name,
             has_local_inner_macros_attr: check_local_inner_macros(&file),
             string: string.to_owned(),
@@ -425,20 +341,19 @@ impl<'opt> CodeEdit<'opt> {
                     *self.out |= i
                         .attrs
                         .iter()
-                        .flat_map(Attribute::parse_meta)
-                        .flat_map(|meta| match meta {
-                            Meta::List(MetaList { path, nested, .. }) => Some((path, nested)),
-                            _ => None,
-                        })
-                        .any(|(path, nested)| {
-                            path.is_ident("macro_export")
-                                && nested.iter().any(|meta| {
-                                    matches!(
-                                        meta,
-                                        NestedMeta::Meta(Meta::Path(path))
-                                        if path.is_ident("local_inner_macros")
-                                    )
-                                })
+                        .filter(|a| a.path().is_ident("macro_export"))
+                        .any(|a| {
+                            let mut r = false;
+
+                            a.parse_nested_meta(|m| {
+                                if m.path.is_ident("local_inner_macros") {
+                                    r = true;
+                                }
+
+                                syn::Result::Ok(())
+                            })
+                            .is_ok()
+                            .and(r)
                         });
                 }
             }
@@ -500,8 +415,7 @@ impl<'opt> CodeEdit<'opt> {
                 if (self.is_lib_to_bundle)(&ident.to_string()) {
                     let is_macro_use = attrs
                         .iter()
-                        .flat_map(Attribute::parse_meta)
-                        .any(|m| m.path().is_ident("macro_use"));
+                        .any(|a| a.path().is_ident("macro_use"));
                     let vis = vis.to_token_stream();
 
                     let mut insertion = "".to_owned();
@@ -614,287 +528,6 @@ impl<'opt> CodeEdit<'opt> {
         }
     }
 
-    pub(crate) fn expand_proc_macros(
-        &mut self,
-        expander: &mut ProcMacroExpander<'_>,
-    ) -> anyhow::Result<()> {
-        self.apply()?;
-
-        loop {
-            self.force_apply()?;
-
-            let code_lines = &self.string.split('\n').collect::<Vec<_>>();
-
-            let mut output = Ok(None);
-            AttributeMacroVisitor {
-                expander,
-                output: &mut output,
-            }
-            .visit_file(&self.file);
-
-            if let Some((span, expansion)) = output? {
-                let end = to_index(code_lines, span.end());
-                let start = to_index(code_lines, span.start());
-                self.string
-                    .insert_str(end, &format!("*/{}", minify_group(expansion)));
-                self.string.insert_str(start, "/*");
-
-                continue;
-            }
-
-            let mut output = Ok(None);
-            DeriveMacroVisitor {
-                expander,
-                output: &mut output,
-            }
-            .visit_file(&self.file);
-
-            if let Some((expansion, item_span, macro_path_span, comma_span)) = output? {
-                let insert_at = to_index(code_lines, item_span.end());
-                let comma_end = comma_span.map(|comma_end| to_index(code_lines, comma_end));
-                let path_range = to_range(code_lines, macro_path_span);
-
-                self.string.insert_str(insert_at, &minify_group(expansion));
-                let end = if let Some(comma_end) = comma_end {
-                    comma_end
-                } else {
-                    path_range.end
-                };
-                self.string.insert_str(end, "*/");
-                self.string.insert_str(path_range.start, "/*");
-
-                continue;
-            }
-
-            let mut output = Ok(None);
-            FunctionLikeMacroVisitor {
-                expander,
-                output: &mut output,
-            }
-            .visit_file(&self.file);
-
-            if let Some((span, expansion)) = output? {
-                let i1 = to_index(code_lines, span.end());
-                let i2 = to_index(code_lines, span.start());
-                self.string
-                    .insert_str(i1, &format!("*/{}", minify_group(expansion)));
-                self.string.insert_str(i2, "/*");
-                continue;
-            }
-
-            return Ok(());
-        }
-
-        struct AttributeMacroVisitor<'a, 'msg> {
-            expander: &'a mut ProcMacroExpander<'msg>,
-            output: &'a mut anyhow::Result<Option<(Span, proc_macro2::Group)>>,
-        }
-
-        impl AttributeMacroVisitor<'_, '_> {
-            fn visit_item_with_attrs<'a, T: ToTokens + Clone + 'a>(
-                &mut self,
-                i: &'a T,
-                attrs: &[Attribute],
-                remove_attr: fn(&mut T, usize) -> Attribute,
-                visit: fn(&mut Self, &'a T),
-            ) {
-                if !matches!(self.output, Ok(None)) {
-                    return;
-                }
-
-                if let Some(result) = attrs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, Attribute { style, .. })| *style == AttrStyle::Outer)
-                    .find_map(|(nth, attr)| {
-                        let Self { expander, .. } = self;
-                        let macro_name = attr.path.get_ident()?.to_string();
-                        expander
-                            .attempt_expand_attr(
-                                &macro_name,
-                                || {
-                                    let i = &mut i.clone();
-                                    remove_attr(i, nth);
-                                    i.to_token_stream()
-                                },
-                                || {
-                                    proc_macro2::Group::new(
-                                        proc_macro2::Delimiter::None,
-                                        syn::parse2::<proc_macro2::Group>(attr.tokens.clone())
-                                            .map(|attr| attr.stream())
-                                            .unwrap_or_default(),
-                                    )
-                                },
-                            )
-                            .transpose()
-                    })
-                {
-                    *self.output = match result {
-                        Ok(expansion) => Ok(Some((i.span(), expansion))),
-                        Err(err) => Err(err),
-                    };
-                } else {
-                    visit(self, i);
-                }
-            }
-        }
-
-        macro_rules! impl_visits {
-            ($(fn $method:ident(&mut self, _: &'_ $ty:path) { _(_, _, _, $visit:path) })*) => {
-                $(
-                    fn $method(&mut self, i: &'_ $ty) {
-                        self.visit_item_with_attrs(i, &i.attrs, |i, nth| i.attrs.remove(nth), $visit)
-                    }
-                )*
-            };
-        }
-
-        impl Visit<'_> for AttributeMacroVisitor<'_, '_> {
-            impl_visits! {
-                fn visit_item_const       (&mut self, _: &'_ ItemConst      ) { _(_, _, _, visit::visit_item_const       ) }
-                fn visit_item_enum        (&mut self, _: &'_ ItemEnum       ) { _(_, _, _, visit::visit_item_enum        ) }
-                fn visit_item_extern_crate(&mut self, _: &'_ ItemExternCrate) { _(_, _, _, visit::visit_item_extern_crate) }
-                fn visit_item_fn          (&mut self, _: &'_ ItemFn         ) { _(_, _, _, visit::visit_item_fn          ) }
-                fn visit_item_foreign_mod (&mut self, _: &'_ ItemForeignMod ) { _(_, _, _, visit::visit_item_foreign_mod ) }
-                fn visit_item_impl        (&mut self, _: &'_ ItemImpl       ) { _(_, _, _, visit::visit_item_impl        ) }
-                fn visit_item_macro       (&mut self, _: &'_ ItemMacro      ) { _(_, _, _, visit::visit_item_macro       ) }
-                fn visit_item_macro2      (&mut self, _: &'_ ItemMacro2     ) { _(_, _, _, visit::visit_item_macro2      ) }
-                fn visit_item_mod         (&mut self, _: &'_ ItemMod        ) { _(_, _, _, visit::visit_item_mod         ) }
-                fn visit_item_static      (&mut self, _: &'_ ItemStatic     ) { _(_, _, _, visit::visit_item_static      ) }
-                fn visit_item_struct      (&mut self, _: &'_ ItemStruct     ) { _(_, _, _, visit::visit_item_struct      ) }
-                fn visit_item_trait       (&mut self, _: &'_ ItemTrait      ) { _(_, _, _, visit::visit_item_trait       ) }
-                fn visit_item_trait_alias (&mut self, _: &'_ ItemTraitAlias ) { _(_, _, _, visit::visit_item_trait_alias ) }
-                fn visit_item_type        (&mut self, _: &'_ ItemType       ) { _(_, _, _, visit::visit_item_type        ) }
-                fn visit_item_union       (&mut self, _: &'_ ItemUnion      ) { _(_, _, _, visit::visit_item_union       ) }
-                fn visit_item_use         (&mut self, _: &'_ ItemUse        ) { _(_, _, _, visit::visit_item_use         ) }
-            }
-        }
-
-        #[allow(clippy::type_complexity)]
-        struct DeriveMacroVisitor<'a, 'msg> {
-            expander: &'a mut ProcMacroExpander<'msg>,
-            output: &'a mut anyhow::Result<
-                Option<(proc_macro2::Group, Span, Span, Option<LineColumn>)>,
-            >,
-        }
-
-        impl DeriveMacroVisitor<'_, '_> {
-            fn visit_struct_enum_union(&mut self, i: impl ToTokens, attrs: &[Attribute]) {
-                if !matches!(self.output, Ok(None)) {
-                    return;
-                }
-
-                if let Some(result) = attrs
-                    .iter()
-                    .flat_map(Attribute::parse_meta)
-                    .flat_map(|meta| match meta {
-                        Meta::List(list_meta) => Some(list_meta),
-                        _ => None,
-                    })
-                    .filter(|MetaList { path, .. }| path.is_ident("derive"))
-                    .flat_map(|MetaList { nested, .. }| nested.into_pairs())
-                    .flat_map(|pair| {
-                        fn get_ident(nested_meta: &NestedMeta) -> Option<String> {
-                            if let NestedMeta::Meta(Meta::Path(path)) = nested_meta {
-                                path.get_ident().map(ToString::to_string)
-                            } else {
-                                None
-                            }
-                        }
-
-                        match pair {
-                            Pair::Punctuated(m, p) => {
-                                Some((get_ident(&m)?, m.span(), Some(p.span().end())))
-                            }
-                            Pair::End(m) => Some((get_ident(&m)?, m.span(), None)),
-                        }
-                    })
-                    .find_map(|(macro_name, path_span, comma_end)| {
-                        let Self { expander, .. } = self;
-                        expander
-                            .attempt_expand_custom_derive(&macro_name, || i.to_token_stream())
-                            .transpose()
-                            .map(move |expansion| {
-                                expansion.map(move |expansion| (expansion, path_span, comma_end))
-                            })
-                    })
-                {
-                    *self.output = match result {
-                        Ok((expansion, path_span, comma_end)) => {
-                            Ok(Some((expansion, i.span(), path_span, comma_end)))
-                        }
-                        Err(err) => Err(err),
-                    };
-                }
-            }
-        }
-
-        impl Visit<'_> for DeriveMacroVisitor<'_, '_> {
-            fn visit_item_struct(&mut self, i: &'_ ItemStruct) {
-                self.visit_struct_enum_union(i, &i.attrs);
-            }
-
-            fn visit_item_enum(&mut self, i: &'_ ItemEnum) {
-                self.visit_struct_enum_union(i, &i.attrs);
-            }
-
-            fn visit_item_union(&mut self, i: &'_ ItemUnion) {
-                self.visit_struct_enum_union(i, &i.attrs);
-            }
-        }
-
-        struct FunctionLikeMacroVisitor<'a, 'msg> {
-            expander: &'a mut ProcMacroExpander<'msg>,
-            output: &'a mut anyhow::Result<Option<(Span, proc_macro2::Group)>>,
-        }
-
-        impl Visit<'_> for FunctionLikeMacroVisitor<'_, '_> {
-            fn visit_item_macro(&mut self, i: &'_ ItemMacro) {
-                if i.ident.is_none() {
-                    self.visit_macro(&i.mac);
-                }
-            }
-
-            fn visit_macro(&mut self, i: &'_ Macro) {
-                if !matches!(self.output, Ok(None)) {
-                    return;
-                }
-
-                if let Some(macro_name) = i.path.get_ident() {
-                    let Self { expander, .. } = self;
-                    let expansion = expander
-                        .attempt_expand_func_like(&macro_name.to_string(), || i.tokens.clone());
-
-                    *self.output = match expansion {
-                        Ok(Some(expansion)) => Ok(Some((i.span(), expansion))),
-                        Ok(None) => Ok(None),
-                        Err(err) => Err(err),
-                    };
-                }
-            }
-        }
-
-        fn to_range(lines: &[&str], span: Span) -> Range<usize> {
-            to_index(lines, span.start())..to_index(lines, span.end())
-        }
-
-        fn to_index(lines: &[&str], loc: LineColumn) -> usize {
-            lines[..loc.line - 1]
-                .iter()
-                .map(|s| s.len() + 1)
-                .sum::<usize>()
-                + lines[loc.line - 1]
-                    .char_indices()
-                    .nth(loc.column)
-                    .map(|(i, _)| i)
-                    .unwrap_or_else(|| lines[loc.line - 1].len())
-        }
-
-        fn minify_group(group: proc_macro2::Group) -> String {
-            rustminify::minify_tokens(TokenTree::from(group).into())
-        }
-    }
-
     pub(crate) fn expand_includes(&mut self, out_dir: &Utf8Path) -> anyhow::Result<()> {
         self.apply()?;
         Visitor {
@@ -953,11 +586,12 @@ impl<'opt> CodeEdit<'opt> {
                     && [parse_quote!(::core::include), parse_quote!(::std::include)]
                         .contains(&i.mac.path)
                 {
-                    if let Ok(expr) = syn::parse2(i.mac.tokens.clone()) {
+                    if let syn::Result::Ok(expr) = syn::parse2(i.mac.tokens.clone()) {
                         if let Some(path) = self.resolve(&expr) {
                             let path = Utf8PathBuf::from(path);
                             if path.is_absolute() {
-                                if let Ok(content) = cargo_util::paths::read(path.as_ref()) {
+                                if let Result::Ok(content) = cargo_util::paths::read(path.as_ref())
+                                {
                                     self.replacements
                                         .insert((i.span().start(), i.span().end()), content);
                                 }
@@ -1143,11 +777,7 @@ impl<'opt> CodeEdit<'opt> {
                     pseudo_extern_crate_name,
                     &mut self.replacements,
                 );
-                if attrs
-                    .iter()
-                    .flat_map(Attribute::parse_meta)
-                    .any(|m| m.path().is_ident("macro_export"))
-                {
+                if attrs.iter().any(|a| a.path().is_ident("macro_export")) {
                     let rename = format!(
                         "{}_macro_def_{}_{}",
                         self.cargo_equip_mod_name, pseudo_extern_crate_name, ident,
@@ -1396,17 +1026,20 @@ impl<'opt> CodeEdit<'opt> {
             ) {
                 let sufficiencies = attrs(i)
                     .iter()
-                    .flat_map(|a| a.parse_meta().map(|m| (a.span(), m)))
-                    .flat_map(|(span, meta)| match meta {
-                        Meta::List(meta_list) => Some((span, meta_list)),
-                        _ => None,
-                    })
-                    .filter(|(_, MetaList { path, .. })| path.is_ident("cfg"))
-                    .flat_map(|(span, MetaList { nested, .. })| {
-                        let expr =
-                            cfg_expr::Expression::parse(&nested.to_token_stream().to_string())
-                                .ok()?;
-                        Some((span, expr))
+                    .flat_map(|a| {
+                        let mut results = vec![];
+                        a.parse_nested_meta(|m| {
+                            if m.path.is_ident("cfg") {
+                                if let Some(e) =
+                                    cfg_expr::Expression::parse(&m.input.to_string()).ok()
+                                {
+                                    results.push((a.span(), e));
+                                };
+                            }
+                            syn::Result::Ok(())
+                        })
+                        .map(|_| results)
+                        .unwrap_or_default()
                     })
                     .map(|(span, expr)| {
                         let sufficiency = expr.eval(|pred| match pred {
@@ -1456,12 +1089,10 @@ impl<'opt> CodeEdit<'opt> {
                 fn visit_const_param        (&mut self, _: &'_ ConstParam       ) { _(_, _, visit::visit_const_param        ) }
                 fn visit_expr_array         (&mut self, _: &'_ ExprArray        ) { _(_, _, visit::visit_expr_array         ) }
                 fn visit_expr_assign        (&mut self, _: &'_ ExprAssign       ) { _(_, _, visit::visit_expr_assign        ) }
-                fn visit_expr_assign_op     (&mut self, _: &'_ ExprAssignOp     ) { _(_, _, visit::visit_expr_assign_op     ) }
                 fn visit_expr_async         (&mut self, _: &'_ ExprAsync        ) { _(_, _, visit::visit_expr_async         ) }
                 fn visit_expr_await         (&mut self, _: &'_ ExprAwait        ) { _(_, _, visit::visit_expr_await         ) }
                 fn visit_expr_binary        (&mut self, _: &'_ ExprBinary       ) { _(_, _, visit::visit_expr_binary        ) }
                 fn visit_expr_block         (&mut self, _: &'_ ExprBlock        ) { _(_, _, visit::visit_expr_block         ) }
-                fn visit_expr_box           (&mut self, _: &'_ ExprBox          ) { _(_, _, visit::visit_expr_box           ) }
                 fn visit_expr_break         (&mut self, _: &'_ ExprBreak        ) { _(_, _, visit::visit_expr_break         ) }
                 fn visit_expr_call          (&mut self, _: &'_ ExprCall         ) { _(_, _, visit::visit_expr_call          ) }
                 fn visit_expr_cast          (&mut self, _: &'_ ExprCast         ) { _(_, _, visit::visit_expr_cast          ) }
@@ -1488,7 +1119,6 @@ impl<'opt> CodeEdit<'opt> {
                 fn visit_expr_try           (&mut self, _: &'_ ExprTry          ) { _(_, _, visit::visit_expr_try           ) }
                 fn visit_expr_try_block     (&mut self, _: &'_ ExprTryBlock     ) { _(_, _, visit::visit_expr_try_block     ) }
                 fn visit_expr_tuple         (&mut self, _: &'_ ExprTuple        ) { _(_, _, visit::visit_expr_tuple         ) }
-                fn visit_expr_type          (&mut self, _: &'_ ExprType         ) { _(_, _, visit::visit_expr_type          ) }
                 fn visit_expr_unary         (&mut self, _: &'_ ExprUnary        ) { _(_, _, visit::visit_expr_unary         ) }
                 fn visit_expr_unsafe        (&mut self, _: &'_ ExprUnsafe       ) { _(_, _, visit::visit_expr_unsafe        ) }
                 fn visit_expr_while         (&mut self, _: &'_ ExprWhile        ) { _(_, _, visit::visit_expr_while         ) }
@@ -1503,7 +1133,6 @@ impl<'opt> CodeEdit<'opt> {
                 fn visit_foreign_item_type  (&mut self, _: &'_ ForeignItemType  ) { _(_, _, visit::visit_foreign_item_type  ) }
                 fn visit_impl_item_const    (&mut self, _: &'_ ImplItemConst    ) { _(_, _, visit::visit_impl_item_const    ) }
                 fn visit_impl_item_macro    (&mut self, _: &'_ ImplItemMacro    ) { _(_, _, visit::visit_impl_item_macro    ) }
-                fn visit_impl_item_method   (&mut self, _: &'_ ImplItemMethod   ) { _(_, _, visit::visit_impl_item_method   ) }
                 fn visit_impl_item_type     (&mut self, _: &'_ ImplItemType     ) { _(_, _, visit::visit_impl_item_type     ) }
                 fn visit_item_const         (&mut self, _: &'_ ItemConst        ) { _(_, _, visit::visit_item_const         ) }
                 fn visit_item_enum          (&mut self, _: &'_ ItemEnum         ) { _(_, _, visit::visit_item_enum          ) }
@@ -1512,7 +1141,6 @@ impl<'opt> CodeEdit<'opt> {
                 fn visit_item_foreign_mod   (&mut self, _: &'_ ItemForeignMod   ) { _(_, _, visit::visit_item_foreign_mod   ) }
                 fn visit_item_impl          (&mut self, _: &'_ ItemImpl         ) { _(_, _, visit::visit_item_impl          ) }
                 fn visit_item_macro         (&mut self, _: &'_ ItemMacro        ) { _(_, _, visit::visit_item_macro         ) }
-                fn visit_item_macro2        (&mut self, _: &'_ ItemMacro2       ) { _(_, _, visit::visit_item_macro2        ) }
                 fn visit_item_mod           (&mut self, _: &'_ ItemMod          ) { _(_, _, visit::visit_item_mod           ) }
                 fn visit_item_static        (&mut self, _: &'_ ItemStatic       ) { _(_, _, visit::visit_item_static        ) }
                 fn visit_item_struct        (&mut self, _: &'_ ItemStruct       ) { _(_, _, visit::visit_item_struct        ) }
@@ -1521,15 +1149,9 @@ impl<'opt> CodeEdit<'opt> {
                 fn visit_item_type          (&mut self, _: &'_ ItemType         ) { _(_, _, visit::visit_item_type          ) }
                 fn visit_item_union         (&mut self, _: &'_ ItemUnion        ) { _(_, _, visit::visit_item_union         ) }
                 fn visit_item_use           (&mut self, _: &'_ ItemUse          ) { _(_, _, visit::visit_item_use           ) }
-                fn visit_lifetime_def       (&mut self, _: &'_ LifetimeDef      ) { _(_, _, visit::visit_lifetime_def       ) }
                 fn visit_local              (&mut self, _: &'_ Local            ) { _(_, _, visit::visit_local              ) }
-                fn visit_pat_box            (&mut self, _: &'_ PatBox           ) { _(_, _, visit::visit_pat_box            ) }
                 fn visit_pat_ident          (&mut self, _: &'_ PatIdent         ) { _(_, _, visit::visit_pat_ident          ) }
-                fn visit_pat_lit            (&mut self, _: &'_ PatLit           ) { _(_, _, visit::visit_pat_lit            ) }
-                fn visit_pat_macro          (&mut self, _: &'_ PatMacro         ) { _(_, _, visit::visit_pat_macro          ) }
                 fn visit_pat_or             (&mut self, _: &'_ PatOr            ) { _(_, _, visit::visit_pat_or             ) }
-                fn visit_pat_path           (&mut self, _: &'_ PatPath          ) { _(_, _, visit::visit_pat_path           ) }
-                fn visit_pat_range          (&mut self, _: &'_ PatRange         ) { _(_, _, visit::visit_pat_range          ) }
                 fn visit_pat_reference      (&mut self, _: &'_ PatReference     ) { _(_, _, visit::visit_pat_reference      ) }
                 fn visit_pat_rest           (&mut self, _: &'_ PatRest          ) { _(_, _, visit::visit_pat_rest           ) }
                 fn visit_pat_slice          (&mut self, _: &'_ PatSlice         ) { _(_, _, visit::visit_pat_slice          ) }
@@ -1541,7 +1163,6 @@ impl<'opt> CodeEdit<'opt> {
                 fn visit_receiver           (&mut self, _: &'_ Receiver         ) { _(_, _, visit::visit_receiver           ) }
                 fn visit_trait_item_const   (&mut self, _: &'_ TraitItemConst   ) { _(_, _, visit::visit_trait_item_const   ) }
                 fn visit_trait_item_macro   (&mut self, _: &'_ TraitItemMacro   ) { _(_, _, visit::visit_trait_item_macro   ) }
-                fn visit_trait_item_method  (&mut self, _: &'_ TraitItemMethod  ) { _(_, _, visit::visit_trait_item_method  ) }
                 fn visit_trait_item_type    (&mut self, _: &'_ TraitItemType    ) { _(_, _, visit::visit_trait_item_type    ) }
                 fn visit_type_param         (&mut self, _: &'_ TypeParam        ) { _(_, _, visit::visit_type_param         ) }
                 fn visit_variadic           (&mut self, _: &'_ Variadic         ) { _(_, _, visit::visit_variadic           ) }
@@ -1562,25 +1183,22 @@ impl<'opt> CodeEdit<'opt> {
 
         impl Visit<'_> for Visitor<'_> {
             fn visit_attribute(&mut self, i: &Attribute) {
-                if let Ok(Meta::List(MetaList { path, nested, .. })) = i.parse_meta() {
-                    if ["warn", "deny", "forbid"]
-                        .iter()
-                        .any(|lint| path.is_ident(lint))
-                    {
-                        for meta in nested {
-                            if let NestedMeta::Meta(Meta::Path(path)) = meta {
-                                if ["missing_docs", "missing_crate_level_docs"]
-                                    .iter()
-                                    .any(|lint| path.is_ident(lint))
-                                {
-                                    let pos = path.span().start();
-                                    self.replacements.insert((pos, pos), "/*".to_owned());
-                                    let pos = path.span().end();
-                                    self.replacements.insert((pos, pos), "*/".to_owned());
-                                }
-                            }
+                if let Meta::List(ml) = &i.meta {
+                    ml.parse_nested_meta(|meta| {
+                        let path = meta.path;
+                        if ["missing_docs", "missing_crate_level_docs"]
+                            .iter()
+                            .any(|lint| path.is_ident(lint))
+                        {
+                            let pos = path.span().start();
+                            self.replacements.insert((pos, pos), "/*".to_owned());
+                            let pos = path.span().end();
+                            self.replacements.insert((pos, pos), "*/".to_owned());
                         }
-                    }
+
+                        syn::Result::Ok(())
+                    })
+                    .unwrap_or_default();
                 }
             }
         }
@@ -1596,7 +1214,7 @@ impl<'opt> CodeEdit<'opt> {
 
         impl Visit<'_> for Visitor<'_> {
             fn visit_attribute(&mut self, attr: &'_ Attribute) {
-                if matches!(attr.parse_meta(), Ok(m) if m.path().is_ident("doc")) {
+                if attr.meta.path().is_ident("doc") {
                     set_span(self.0, attr.span(), true);
                 }
             }
@@ -1610,7 +1228,7 @@ impl<'opt> CodeEdit<'opt> {
                     mask.insert_range(..);
                 }
                 visit_token_stream(mask, token_stream);
-                Ok(())
+                syn::Result::Ok(())
             },
             || "broke the code during erasing comments",
         );

@@ -2,7 +2,6 @@
 #![recursion_limit = "256"]
 
 mod process;
-mod ra_proc_macro;
 mod rust;
 mod rustfmt;
 pub mod shell;
@@ -10,7 +9,6 @@ mod toolchain;
 mod workspace;
 
 use crate::{
-    ra_proc_macro::ProcMacroExpander,
     rust::CodeEdit,
     shell::Shell,
     workspace::{
@@ -28,10 +26,9 @@ use petgraph::{
     visit::Dfs,
 };
 use prettytable::{Table, cell, format::FormatBuilder, row};
-use quote::quote;
 use std::{
     cmp,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
     path::{Path, PathBuf},
     rc::Rc,
@@ -712,7 +709,7 @@ fn bundle(
         .any(|p| metadata[p].has_custom_build());
     let has_proc_macro = libs_to_bundle.keys().any(|p| metadata[p].has_proc_macro());
 
-    let (cargo_messages_for_out_dirs, cargo_messages_for_proc_macro_dll_paths) =
+    let (cargo_messages_for_out_dirs, _cargo_messages_for_proc_macro_dll_paths) =
         if has_custom_build && has_proc_macro && active_toolchain == toolchain_for_proc_macro_srv {
             let cargo_messages = cargo_check_message_format_json(active_toolchain, shell)?;
             (cargo_messages.clone(), Some(cargo_messages))
@@ -732,39 +729,6 @@ fn bundle(
         };
 
     let out_dirs = workspace::list_out_dirs(metadata, &cargo_messages_for_out_dirs);
-
-    let macro_expander = cargo_messages_for_proc_macro_dll_paths
-        .as_ref()
-        .map(|cargo_messages_for_proc_macro_dll_paths| {
-            let proc_macro_srv_exe = &toolchain::find_rust_analyzer_proc_macro_srv(
-                root_crate.package().manifest_dir(),
-                toolchain_for_proc_macro_srv,
-            )?;
-
-            let proc_macro_crate_dylibs = &ra_proc_macro::list_proc_macro_dylibs(
-                cargo_messages_for_proc_macro_dll_paths,
-                |p| libs_to_bundle.contains_key(p),
-            );
-
-            ProcMacroExpander::spawn(proc_macro_srv_exe, proc_macro_crate_dylibs)
-        })
-        .transpose()?;
-
-    let proc_macro_names = macro_expander
-        .as_ref()
-        .map(|macro_expander| {
-            let mut proc_macro_names = HashMap::<_, BTreeSet<_>>::new();
-            for (pkg, macro_names) in macro_expander.macro_names() {
-                for macro_name in macro_names {
-                    proc_macro_names
-                        .entry(pkg)
-                        .or_default()
-                        .insert(macro_name.to_owned());
-                }
-            }
-            proc_macro_names
-        })
-        .unwrap_or_default();
 
     let resolve_nodes = metadata
         .resolve
@@ -792,7 +756,6 @@ fn bundle(
         code = rust::process_bin(
             cargo_equip_mod_name,
             &bin_target.src_path,
-            { macro_expander }.as_mut(),
             |extern_crate_name| {
                 metadata
                     .dep_lib_by_extern_crate_name(&bin_package.id, extern_crate_name)
@@ -823,34 +786,6 @@ fn bundle(
 
     let (graph, indices) = normal_non_host_dep_graph(&resolve_nodes, libs_to_bundle);
 
-    let libs_using_proc_macros = {
-        let mut crates_using_proc_macros = BTreeMap::<_, HashSet<_>>::new();
-        for (pkg, names) in &proc_macro_names {
-            let (_, pseudo_extern_crate_name) = &libs_to_bundle[pkg];
-            for name in names {
-                crates_using_proc_macros
-                    .entry(&**name)
-                    .or_default()
-                    .insert(&**pseudo_extern_crate_name);
-            }
-        }
-        for goal in libs_to_bundle.keys() {
-            if metadata[goal].has_proc_macro() {
-                let mut dfs = Dfs::new(&graph, indices[goal]);
-                while let Some(next) = dfs.next(&graph) {
-                    let (_, pseudo_extern_crate_name) = &libs_to_bundle[graph[next]];
-                    for name in &proc_macro_names[goal] {
-                        crates_using_proc_macros
-                            .entry(name)
-                            .or_default()
-                            .insert(pseudo_extern_crate_name);
-                    }
-                }
-            }
-        }
-        crates_using_proc_macros
-    };
-
     let libs_with_local_inner_macros = {
         let mut libs_with_local_inner_macros = libs
             .keys()
@@ -877,60 +812,8 @@ fn bundle(
     let libs = libs
         .into_iter()
         .map(
-            |(lib_package, (lib_target, pseudo_extern_crate_name, mut edit))| {
+            |(lib_package, (_lib_target, pseudo_extern_crate_name, mut edit))| {
                 let lib_package: &cm::Package = &metadata[lib_package];
-
-                if let Some(names) = proc_macro_names.get(&lib_package.id) {
-                    debug_assert_eq!(vec![cargo_metadata::TargetKind::ProcMacro], lib_target.kind);
-                    let names = names
-                        .iter()
-                        .map(|name| {
-                            let rename = format!(
-                                "{}_macro_def_{}_{}",
-                                cargo_equip_mod_name, pseudo_extern_crate_name, name,
-                            );
-                            (name, rename)
-                        })
-                        .collect::<Vec<_>>();
-                    let crate_mod_content = format!(
-                        "pub use crate::{}::macros::{}::*;{}",
-                        cargo_equip_mod_name,
-                        pseudo_extern_crate_name,
-                        names
-                            .iter()
-                            .map(|(name, rename)| {
-                                let msg = format!(
-                                    "`{}` from `{} {}` should have been expanded",
-                                    name, lib_package.name, lib_package.version,
-                                );
-                                format!(
-                                    "#[macro_export]macro_rules!{}\
-                                     {{($(_:tt)*)=>(::std::compile_error!({});)}}",
-                                    rename,
-                                    quote!(#msg),
-                                )
-                            })
-                            .join("")
-                    );
-                    let macro_mod_content = format!(
-                        "pub use crate::{}{}{};",
-                        if names.len() == 1 { " " } else { "{" },
-                        names
-                            .iter()
-                            .map(|(name, rename)| format!("{} as {}", rename, name))
-                            .format(","),
-                        if names.len() == 1 { "" } else { "}" },
-                    );
-                    return Ok((
-                        pseudo_extern_crate_name,
-                        (
-                            lib_package,
-                            crate_mod_content,
-                            macro_mod_content,
-                            "".to_owned(),
-                        ),
-                    ));
-                }
 
                 let cm::Node { features, .. } = resolve_nodes[&lib_package.id];
 
@@ -1012,14 +895,6 @@ fn bundle(
         }
 
         code = rust::insert_prelude_for_main_crate(&code, cargo_equip_mod_name)?;
-
-        code =
-            rust::allow_unused_imports_for_seemingly_proc_macros(&code, |mod_name, item_name| {
-                matches!(
-                    libs_using_proc_macros.get(item_name), Some(pseudo_extern_crate_names)
-                    if pseudo_extern_crate_names.contains(mod_name)
-                )
-            })?;
 
         let doc = &{
             fn list_packages<'a>(
